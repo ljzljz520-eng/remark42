@@ -174,6 +174,10 @@ func (s *private) createCommentCtrl(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[DEBUG] created comment %+v", finalComment)
 
+	// Content-Type must be set before WriteHeader: rest.RenderJSON sets it too, but
+	// header modifications after WriteHeader are ignored, which would leave the response
+	// without an explicit content type and cause the body to be sniffed as text/plain.
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	R.RenderJSON(w, &finalComment)
 }
