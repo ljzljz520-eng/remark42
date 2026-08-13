@@ -20,14 +20,14 @@ type Email struct {
 type EmailParams struct {
 	Host        string // SMTP host
 	Port        int    // SMTP port
-	From        string // From email field
-	Subject     string // Email subject
-	ContentType string // Content type
+	From        string // from email field
+	Subject     string // email subject
+	ContentType string // content type
 
 	TLS                bool          // TLS auth
-	StartTLS           bool          // StartTLS auth
-	InsecureSkipVerify bool          // Skip certificate verification
-	Charset            string        // Character set
+	StartTLS           bool          // startTLS auth
+	InsecureSkipVerify bool          // skip certificate verification
+	Charset            string        // character set
 	LoginAuth          bool          // LOGIN auth method instead of default PLAIN, needed for Office 365 and outlook.com
 	SMTPUserName       string        // username
 	SMTPPassword       string        // password
@@ -79,9 +79,13 @@ func NewEmailClient(emailParams EmailParams, l logger.L) *Email {
 	return &Email{EmailParams: emailParams, L: l, sender: sender}
 }
 
-// Send email with given text
+// Send email with given text. The body is not logged: confirmation emails
+// sent by the verify provider contain a one-shot magic-link token, and any
+// party with log access could redeem it before the user does. Logging only
+// the recipient and body length keeps the line useful for operators
+// without leaking the credential.
 func (e *Email) Send(to, text string) error {
-	e.Logf("[DEBUG] send %q to %s", text, to)
+	e.Logf("[DEBUG] send %d-byte message to %s", len(text), to)
 	return e.sender.Send(text, email.Params{
 		From:    e.From,
 		To:      []string{to},
