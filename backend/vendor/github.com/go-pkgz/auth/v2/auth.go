@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-pkgz/rest"
@@ -26,14 +27,16 @@ type Client struct {
 
 // Service provides higher level wrapper allowing to construct everything and get back token middleware
 type Service struct {
-	logger         logger.L
-	opts           Opts
-	jwtService     *token.Service
-	providers      []provider.Service
-	authMiddleware middleware.Authenticator
-	avatarProxy    *avatar.Proxy
-	issuer         string
-	useGravatar    bool
+	logger                logger.L
+	opts                  Opts
+	jwtService            *token.Service
+	providers             []provider.Service
+	authMiddleware        middleware.Authenticator
+	avatarProxy           *avatar.Proxy
+	issuer                string
+	useGravatar           bool
+	verifConfirmStore     provider.VerifConfirmationStore
+	verifConfirmStoreOnce sync.Once
 }
 
 // Opts is a full set of all parameters to initialize Service
@@ -55,7 +58,7 @@ type Opts struct {
 	XSRFHeaderKey     string        // default "X-XSRF-TOKEN"
 	XSRFIgnoreMethods []string      // disable XSRF protection for the specified request methods (ex. []string{"GET", "POST")}, default empty
 	JWTQuery          string        // default "token"
-	SendJWTHeader     bool          // if enabled send JWT as a header instead of cookie
+	SendJWTHeader     bool          // if enabled, also send JWT as a response header (in addition to the cookie)
 	SameSiteCookie    http.SameSite // limit cross-origin requests with SameSite cookie attribute
 
 	Issuer string // optional value for iss claim, usually the application name, default "go-pkgz/auth"
@@ -63,22 +66,40 @@ type Opts struct {
 	URL       string          // root url for the rest service, i.e. http://blah.example.com, required
 	Validator token.Validator // validator allows to reject some valid tokens with user-defined logic
 
+	// AllowedRedirectHosts lists hostnames accepted in the "from" query
+	// parameter of OAuth/verify login flows. Setting this field enables
+	// host validation: the host of URL is always implicit, and any other
+	// host must appear here. Nil (the default) disables validation and
+	// preserves legacy permissive behavior — any non-empty "from" value
+	// is honored. Hardening is opt-in; to restrict to the service host
+	// only, pass a getter returning an empty slice.
+	AllowedRedirectHosts token.AllowedHosts
+
 	AvatarStore       avatar.Store // store to save/load avatars, required (use avatar.NoOp to disable avatars support)
 	AvatarResizeLimit int          // resize avatar's limit in pixels
 	AvatarRoutePath   string       // avatar routing prefix, i.e. "/api/v1/avatar", default `/avatar`
 	UseGravatar       bool         // for email based auth (verified provider) use gravatar service
 
-	AdminPasswd      string                   // if presented, allows basic auth with user admin and given password
-	BasicAuthChecker middleware.BasicAuthFunc // user custom checker for basic auth, if one defined then "AdminPasswd" will ignored
-	AudienceReader   token.Audience           // list of allowed aud values, default (empty) allows any
-	AudSecrets       bool                     // allow multiple secrets (secret per aud)
-	Logger           logger.L                 // logger interface, default is no logging at all
-	RefreshCache     middleware.RefreshCache  // optional cache to keep refreshed tokens
+	AdminPasswd      string                      // if presented, allows basic auth with user admin and given password
+	BasicAuthChecker middleware.BasicAuthFunc    // custom checker for basic auth; when set, AdminPasswd is bypassed entirely
+	AudienceReader   token.Audience              // list of allowed aud values, default (empty) allows any
+	AudSecrets       bool                        // allow multiple secrets (secret per aud)
+	Logger           logger.L                    // logger interface, default is no logging at all
+	RefreshCache     middleware.RefreshCache     // optional cache to keep refreshed tokens
+	ErrorHandler     middleware.ErrorHandlerFunc // custom error handler for auth failures
+
+	// VerifConfirmationStore enforces one-shot consumption of email
+	// confirmation tokens issued by the verify provider. The default
+	// (nil) installs an in-memory store on first use of AddVerifProvider —
+	// fine for single-instance deployments. Multi-instance deployments
+	// MUST supply a shared backend (e.g. Redis) implementing
+	// provider.VerifConfirmationStore, otherwise replay rejection works
+	// only on the instance that consumed the token.
+	VerifConfirmationStore provider.VerifConfirmationStore
 }
 
 // NewService initializes everything
 func NewService(opts Opts) (res *Service) {
-
 	res = &Service{
 		opts:   opts,
 		logger: opts.Logger,
@@ -87,6 +108,7 @@ func NewService(opts Opts) (res *Service) {
 			AdminPasswd:      opts.AdminPasswd,
 			BasicAuthChecker: opts.BasicAuthChecker,
 			RefreshCache:     opts.RefreshCache,
+			ErrorHandler:     opts.ErrorHandler,
 		},
 		issuer:      opts.Issuer,
 		useGravatar: opts.UseGravatar,
@@ -172,8 +194,7 @@ func (s *Service) Handlers() (authHandler, avatarHandler http.Handler) {
 		// allow logout without specifying provider
 		if elems[len(elems)-1] == "logout" {
 			if len(s.providers) == 0 {
-				w.WriteHeader(http.StatusBadRequest)
-				rest.RenderJSON(w, rest.JSON{"error": "providers not defined"})
+				_ = rest.EncodeJSON(w, http.StatusBadRequest, rest.JSON{"error": "providers not defined"})
 				return
 			}
 			s.providers[0].Handler(w, r)
@@ -184,12 +205,11 @@ func (s *Service) Handlers() (authHandler, avatarHandler http.Handler) {
 		if elems[len(elems)-1] == "user" {
 			claims, _, err := s.jwtService.Get(r)
 			if err != nil || claims.User == nil {
-				w.WriteHeader(http.StatusUnauthorized)
 				msg := "user is nil"
 				if err != nil {
 					msg = err.Error()
 				}
-				rest.RenderJSON(w, rest.JSON{"error": msg})
+				_ = rest.EncodeJSON(w, http.StatusUnauthorized, rest.JSON{"error": msg})
 				return
 			}
 			rest.RenderJSON(w, claims.User)
@@ -211,14 +231,32 @@ func (s *Service) Handlers() (authHandler, avatarHandler http.Handler) {
 		provName := elems[len(elems)-2]
 		p, err := s.Provider(provName)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			rest.RenderJSON(w, rest.JSON{"error": fmt.Sprintf("provider %s not supported", provName)})
+			_ = rest.EncodeJSON(w, http.StatusBadRequest, rest.JSON{"error": fmt.Sprintf("provider %s not supported", provName)})
 			return
 		}
 		p.Handler(w, r)
 	}
 
-	return http.HandlerFunc(ah), http.HandlerFunc(s.avatarProxy.Handler)
+	return withSecurityHeaders(http.HandlerFunc(ah)), withSecurityHeaders(http.HandlerFunc(s.avatarProxy.Handler))
+}
+
+// withSecurityHeaders wraps a handler to set Content-Security-Policy
+// "default-src 'none'; sandbox; frame-ancestors 'none'" and X-Content-Type-Options
+// "nosniff" on every response. Safe to apply unconditionally because go-pkgz/auth
+// only emits JSON (auth routes) and images (avatar route).
+//
+// CONSUMER NOTE: custom providers registered through AddCustomHandler / AddProvider
+// are wrapped too. A provider that renders HTML (login form, JS flow, custom server
+// login page, etc.) will be blocked by this CSP — default-src 'none' plus sandbox
+// stop scripts, styles, forms, and images even when served from 'self'. Such
+// providers must override the CSP on their own response (call w.Header().Set before
+// writing — Set replaces the wrapper's value) and relax only the directives needed.
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox; frame-ancestors 'none'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Middleware returns auth middleware
@@ -229,14 +267,15 @@ func (s *Service) Middleware() middleware.Authenticator {
 // AddProviderWithUserAttributes adds provider with user attributes mapping
 func (s *Service) AddProviderWithUserAttributes(name, cid, csecret string, userAttributes provider.UserAttributes) {
 	p := provider.Params{
-		URL:            s.opts.URL,
-		JwtService:     s.jwtService,
-		Issuer:         s.issuer,
-		AvatarSaver:    s.avatarProxy,
-		Cid:            cid,
-		Csecret:        csecret,
-		L:              s.logger,
-		UserAttributes: userAttributes,
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		Cid:                  cid,
+		Csecret:              csecret,
+		L:                    s.logger,
+		UserAttributes:       userAttributes,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
 	}
 	s.addProviderByName(name, p)
 }
@@ -311,28 +350,72 @@ func (s *Service) isValidProviderName(name string) bool {
 // AddProvider adds provider for given name
 func (s *Service) AddProvider(name, cid, csecret string) {
 	p := provider.Params{
-		URL:            s.opts.URL,
-		JwtService:     s.jwtService,
-		Issuer:         s.issuer,
-		AvatarSaver:    s.avatarProxy,
-		Cid:            cid,
-		Csecret:        csecret,
-		L:              s.logger,
-		UserAttributes: map[string]string{},
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		Cid:                  cid,
+		Csecret:              csecret,
+		L:                    s.logger,
+		UserAttributes:       map[string]string{},
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
 	}
 	s.addProviderByName(name, p)
+}
+
+// AddMicrosoftProvider adds microsoft provider with a configurable tenant.
+// If tenant is empty, "common" is used. For single-tenant Entra ID apps,
+// pass the directory (tenant) ID or domain name.
+// For advanced configuration (e.g., UserAttributes), construct provider.Params directly.
+func (s *Service) AddMicrosoftProvider(cid, csecret, tenant string) {
+	p := provider.Params{
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		Cid:                  cid,
+		Csecret:              csecret,
+		L:                    s.logger,
+		UserAttributes:       map[string]string{},
+		MicrosoftTenant:      tenant,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
+	}
+	s.addProvider(provider.NewMicrosoft(p))
+}
+
+// AddGithubProviderWithNumericID adds github provider deriving the user id from the immutable
+// numeric account id instead of the login. Logins are released on rename or account removal and
+// can be claimed by someone else, so an id derived from login may be inherited by the next holder
+// of the name. This changes the id of every existing github user, see README for the migration note.
+// If the response carries no usable numeric id the login-derived id is kept.
+// For advanced configuration (e.g., UserAttributes), construct provider.Params directly.
+func (s *Service) AddGithubProviderWithNumericID(cid, csecret string) {
+	p := provider.Params{
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		Cid:                  cid,
+		Csecret:              csecret,
+		L:                    s.logger,
+		UserAttributes:       map[string]string{},
+		GithubNumericID:      true,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
+	}
+	s.addProvider(provider.NewGithub(p))
 }
 
 // AddDevProvider with a custom host and port
 func (s *Service) AddDevProvider(host string, port int) {
 	p := provider.Params{
-		URL:         s.opts.URL,
-		JwtService:  s.jwtService,
-		Issuer:      s.issuer,
-		AvatarSaver: s.avatarProxy,
-		L:           s.logger,
-		Port:        port,
-		Host:        host,
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		L:                    s.logger,
+		Port:                 port,
+		Host:                 host,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
 	}
 	s.addProvider(provider.NewDev(p))
 }
@@ -340,14 +423,15 @@ func (s *Service) AddDevProvider(host string, port int) {
 // AddAppleProvider allow SignIn with Apple ID
 func (s *Service) AddAppleProvider(appleConfig provider.AppleConfig, privKeyLoader provider.PrivateKeyLoaderInterface) error {
 	p := provider.Params{
-		URL:         s.opts.URL,
-		JwtService:  s.jwtService,
-		Issuer:      s.issuer,
-		AvatarSaver: s.avatarProxy,
-		L:           s.logger,
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		L:                    s.logger,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
 	}
 
-	// Error checking at create need for catch one when apple private key init
+	// error checking at create need for catch one when apple private key init
 	appleProvider, err := provider.NewApple(p, appleConfig, privKeyLoader)
 	if err != nil {
 		return fmt.Errorf("an AppleProvider creating failed: %w", err)
@@ -360,13 +444,14 @@ func (s *Service) AddAppleProvider(appleConfig provider.AppleConfig, privKeyLoad
 // AddCustomProvider adds custom provider (e.g. https://gopkg.in/oauth2.v3)
 func (s *Service) AddCustomProvider(name string, client Client, copts provider.CustomHandlerOpt) {
 	p := provider.Params{
-		URL:         s.opts.URL,
-		JwtService:  s.jwtService,
-		Issuer:      s.issuer,
-		AvatarSaver: s.avatarProxy,
-		Cid:         client.Cid,
-		Csecret:     client.Csecret,
-		L:           s.logger,
+		URL:                  s.opts.URL,
+		JwtService:           s.jwtService,
+		Issuer:               s.issuer,
+		AvatarSaver:          s.avatarProxy,
+		Cid:                  client.Cid,
+		Csecret:              client.Csecret,
+		L:                    s.logger,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
 	}
 	s.addProvider(provider.NewCustom(name, p, copts))
 }
@@ -403,15 +488,33 @@ func (s *Service) AddDirectProviderWithUserIDFunc(name string, credChecker provi
 
 // AddVerifProvider adds provider user's verification sent by sender
 func (s *Service) AddVerifProvider(name, msgTmpl string, sender provider.Sender) {
+	s.verifConfirmStoreOnce.Do(func() {
+		store := s.opts.VerifConfirmationStore
+		// guard against a typed-nil VerifConfirmationStoreFunc: a non-nil
+		// interface wrapping a nil func would survive the != nil check below
+		// and silently disable replay protection (the handler-level guard
+		// at LoginHandler then normalizes it to nil).
+		if fn, ok := store.(provider.VerifConfirmationStoreFunc); ok && fn == nil {
+			store = nil
+		}
+		if store != nil {
+			s.verifConfirmStore = store
+			return
+		}
+		s.verifConfirmStore = provider.NewInMemoryVerifStore()
+	})
 	dh := provider.VerifyHandler{
-		L:            s.logger,
-		ProviderName: name,
-		Issuer:       s.issuer,
-		TokenService: s.jwtService,
-		AvatarSaver:  s.avatarProxy,
-		Sender:       sender,
-		Template:     msgTmpl,
-		UseGravatar:  s.useGravatar,
+		L:                    s.logger,
+		ProviderName:         name,
+		Issuer:               s.issuer,
+		TokenService:         s.jwtService,
+		AvatarSaver:          s.avatarProxy,
+		Sender:               sender,
+		Template:             msgTmpl,
+		UseGravatar:          s.useGravatar,
+		URL:                  s.opts.URL,
+		AllowedRedirectHosts: s.opts.AllowedRedirectHosts,
+		ConfirmationStore:    s.verifConfirmStore,
 	}
 	s.addProvider(dh)
 }
@@ -423,7 +526,7 @@ func (s *Service) AddCustomHandler(p provider.Provider) {
 
 // DevAuth makes dev oauth2 server, for testing and development only!
 func (s *Service) DevAuth() (*provider.DevAuthServer, error) {
-	p, err := s.Provider("dev") // peak dev provider
+	p, err := s.Provider("dev") // peek dev provider
 	if err != nil {
 		return nil, fmt.Errorf("dev provider not registered: %w", err)
 	}
@@ -451,7 +554,7 @@ func (s *Service) TokenService() *token.Service {
 	return s.jwtService
 }
 
-// AvatarProxy returns stored in service
+// AvatarProxy returns the avatar.Proxy configured on the service, or nil if no AvatarStore was set.
 func (s *Service) AvatarProxy() *avatar.Proxy {
 	return s.avatarProxy
 }

@@ -4,12 +4,28 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
+	"net"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/go-pkgz/auth/v2/avatar"
 	"github.com/go-pkgz/auth/v2/token"
 )
+
+// localBindAddr returns the listen address for the dev oauth and custom-server
+// helpers. Both servers are intended for local development and embedded
+// flows; the historical default ":port" listened on every interface, which
+// silently exposed the dev OAuth UI to anyone on the LAN. Default the bind
+// to 127.0.0.1; callers that explicitly want a non-loopback bind can pass
+// a hostname (e.g. "0.0.0.0" or a specific IP) via Provider.Host (dev) or
+// the URL host (custom-server).
+func localBindAddr(host, port string) string {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
 
 const (
 	urlLoginSuffix    = "/login"
@@ -48,7 +64,7 @@ type Provider interface {
 	LogoutHandler(w http.ResponseWriter, r *http.Request)
 }
 
-// Handler returns auth routes for given provider
+// Handler dispatches login, callback, and logout requests to the underlying provider.
 func (p Service) Handler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -68,6 +84,25 @@ func (p Service) Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
+}
+
+func userDataLogSummary(data UserData) string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return fmt.Sprintf("keys=%v", keys)
+}
+
+func userLogSummary(u token.User) string {
+	attrs := make([]string, 0, len(u.Attributes))
+	for k := range u.Attributes {
+		attrs = append(attrs, k)
+	}
+	slices.Sort(attrs)
+	return fmt.Sprintf("id=%q name=%q picture=%t email=%t attrs=%v role=%t audience=%t",
+		u.ID, u.Name, u.Picture != "", u.Email != "", attrs, u.Role != "", u.Audience != "")
 }
 
 // setAvatar saves avatar and puts proxied URL to u.Picture
